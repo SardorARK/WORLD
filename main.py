@@ -21,9 +21,9 @@ from typing import Any, Awaitable, Callable
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, TelegramObject
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
+from aiogram.filters import Command, CommandStart, ExceptionTypeFilter
+from aiogram.types import CallbackQuery, ErrorEvent, InlineKeyboardMarkup, Message, TelegramObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ══════════════════════════════════════════════════════════════
@@ -458,6 +458,15 @@ async def show(call: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> 
     except TelegramRetryAfter as e:
         logging.warning("Flood control: ждём %s сек", e.retry_after)
         await call.answer(f"⏳ Не так быстро! Подожди {e.retry_after} сек.")
+    except TelegramNetworkError:
+        # Обрыв связи с Telegram (интернет/VPN моргнул) — пробуем ещё раз.
+        logging.warning("Обрыв сети при отправке, повторяю через 1 сек")
+        await asyncio.sleep(1)
+        try:
+            await call.message.edit_text(text, reply_markup=markup)
+            await call.answer()
+        except (TelegramNetworkError, TelegramBadRequest):
+            pass
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
             await call.answer()
@@ -623,6 +632,11 @@ async def main() -> None:
     dp.message.middleware(AntiFloodMiddleware(FLOOD_INTERVAL))
     dp.callback_query.middleware(AntiFloodMiddleware(FLOOD_INTERVAL))
     dp.include_router(router)
+
+    @dp.errors(ExceptionTypeFilter(TelegramNetworkError))
+    async def on_network_error(event: ErrorEvent) -> bool:
+        logging.warning("Сетевая ошибка Telegram: %s", event.exception)
+        return True  # ошибка обработана, трейсбек не нужен
 
     logging.info("⛏ Бот запущен")
     await dp.start_polling(bot)
