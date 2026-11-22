@@ -1,6 +1,6 @@
 """
 ⛏ Mine Bot — игровой Telegram-бот
-Версия 0.2: каменная шахта + инвентарь + защита от флуда
+Версия 0.3: копка по таймеру (1 минута) + инвентарь + защита от флуда
 
 Установка:
     pip install "aiogram>=3.7"
@@ -12,6 +12,7 @@
 import asyncio
 import html
 import logging
+import math
 import random
 import sqlite3
 import time
@@ -32,35 +33,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 BOT_TOKEN = "8806693883:AAHRStDHxDVzlgY72cQamX7GhNf2xY7J8R0"  # токен от @BotFather
 DB_PATH = "game.db"
 
-MINE_COOLDOWN = 1.5      # пауза между ударами киркой (сек)
-FLOOD_INTERVAL = 0.7     # минимум между любыми нажатиями одного игрока (сек)
+DIG_TIME = 60          # сколько длится одна копка (сек)
+FLOOD_INTERVAL = 0.7   # минимум между нажатиями одного игрока (сек)
 
-# Каждый удар кидает отдельный шанс на каждый ресурс.
-# chance — вероятность выпадения, amount — (мин, макс) штук.
+# За одну копку игрок получает случайное число каждого ресурса
+# в диапазоне amount = (мин, макс).
 RESOURCES: dict[str, dict] = {
-    "stone": {"emoji": "🪨", "name": "Камень",  "chance": 0.70, "amount": (1, 2)},
-    "coal":  {"emoji": "⚫",  "name": "Уголь",   "chance": 0.30, "amount": (1, 1)},
-    "flint": {"emoji": "🔥", "name": "Кремень", "chance": 0.30, "amount": (1, 2)},
+    "stone": {"emoji": "🪨", "name": "Камень",  "amount": (15, 25)},
+    "coal":  {"emoji": "⚫", "name": "Уголь",   "amount": (2, 7)},
+    "flint": {"emoji": "🔥", "name": "Кремень", "amount": (5, 12)},
 }
-
-# Разные фразы — заодно делают текст каждый раз новым,
-# поэтому Telegram не ругается «message is not modified».
-SWING_PHRASES = [
-    "Кирка со звоном врезается в породу…",
-    "Эхо удара катится по тёмным тоннелям…",
-    "Из стены сыплется каменная крошка…",
-    "Порода поддаётся с глухим треском…",
-    "Искры летят из-под острия кирки…",
-    "Ты вытираешь пот и бьёшь снова…",
-    "Лампа мигает, а стена трещит по швам…",
-    "Пыль оседает — что-то блеснуло в темноте…",
-]
-
-EMPTY_PHRASES = [
-    "Порода оказалась пустой — ничего не нашлось.",
-    "Удар ушёл впустую, только пыль в лицо.",
-    "Камень раскололся, но внутри ничего ценного.",
-]
 
 LINE = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
 
@@ -87,6 +69,10 @@ db.executescript(
     );
     """
 )
+try:  # миграция для старых баз
+    db.execute("ALTER TABLE users ADD COLUMN dig_end REAL NOT NULL DEFAULT 0")
+except sqlite3.OperationalError:
+    pass
 db.commit()
 
 
@@ -121,31 +107,43 @@ def add_item(user_id: int, item: str, amount: int) -> None:
 # ══════════════════════════════════════════════════════════════
 #  ИГРОВАЯ ЛОГИКА
 # ══════════════════════════════════════════════════════════════
+# Состояния копки (хранится время окончания dig_end):
+#   dig_end == 0          → шахтёр свободен
+#   сейчас < dig_end      → копает
+#   сейчас >= dig_end > 0 → добыча готова, можно забрать
 
-def roll_drops() -> dict[str, int]:
-    """Камень 70% (1–2), уголь 30% (1), кремень 30% (1–2). Удар может выйти пустым."""
-    drops: dict[str, int] = {}
-    for item, res in RESOURCES.items():
-        if random.random() < res["chance"]:
-            drops[item] = random.randint(*res["amount"])
-    return drops
+def dig_state(user_id: int) -> tuple[str, float]:
+    """Возвращает ('idle' | 'digging' | 'ready', секунд до конца)."""
+    end = get_user(user_id)["dig_end"]
+    if end <= 0:
+        return "idle", 0.0
+    left = end - time.time()
+    return ("digging", left) if left > 0 else ("ready", 0.0)
 
 
-def mine(user_id: int) -> dict[str, int] | float:
-    """Удар киркой. Возвращает добычу или число секунд ожидания."""
-    user = get_user(user_id)
-    now = time.time()
-    wait = MINE_COOLDOWN - (now - user["last_mine"])
-    if wait > 0:
-        return wait
+def start_dig(user_id: int) -> bool:
+    """Начинает копку, если шахтёр свободен."""
+    if dig_state(user_id)[0] != "idle":
+        return False
+    db.execute(
+        "UPDATE users SET dig_end = ? WHERE user_id = ?",
+        (time.time() + DIG_TIME, user_id),
+    )
+    db.commit()
+    return True
 
-    drops = roll_drops()
+
+def claim(user_id: int) -> dict[str, int] | None:
+    """Забирает добычу, если копка завершена."""
+    if dig_state(user_id)[0] != "ready":
+        return None
+    drops = {item: random.randint(*res["amount"]) for item, res in RESOURCES.items()}
     for item, amount in drops.items():
         add_item(user_id, item, amount)
     db.execute(
-        "UPDATE users SET mined_total = mined_total + ?, swings = swings + 1, "
-        "last_mine = ? WHERE user_id = ?",
-        (sum(drops.values()), now, user_id),
+        "UPDATE users SET dig_end = 0, swings = swings + 1, "
+        "mined_total = mined_total + ? WHERE user_id = ?",
+        (sum(drops.values()), user_id),
     )
     db.commit()
     return drops
@@ -172,13 +170,6 @@ def menu_kb() -> InlineKeyboardMarkup:
     )
 
 
-def mine_kb() -> InlineKeyboardMarkup:
-    return kb(
-        (("⛏  Ударить киркой", "swing"),),
-        (("🎒 Инвентарь", "inventory"), ("🏠 Меню", "menu")),
-    )
-
-
 def back_kb() -> InlineKeyboardMarkup:
     return kb((("⛏ В шахту", "mine"), ("🏠 Меню", "menu")))
 
@@ -194,34 +185,85 @@ def menu_text(name: str) -> str:
     )
 
 
-def mine_text(last_drops: dict[str, int] | None = None) -> str:
+HEADER = "⛏ <b>Каменная шахта</b>\n" + LINE + "\n"
+
+
+def progress_bar(left: float) -> str:
+    done = round(10 * (1 - left / DIG_TIME))
+    done = max(0, min(10, done))
+    return "▰" * done + "▱" * (10 - done)
+
+
+def idle_screen() -> tuple[str, InlineKeyboardMarkup]:
     text = (
-        "⛏ <b>Каменная шахта</b>\n"
-        f"{LINE}\n"
-        "<i>Сырые своды, капли воды и запах руды. "
+        HEADER
+        + "<i>Сырые своды, капли воды и запах руды. "
         "Где-то в глубине эхом отзывается чужая кирка.</i>\n\n"
-        "🔎 <b>Можно найти:</b>\n"
-        + "\n".join(
-            f"   {r['emoji']} {r['name']}" for r in RESOURCES.values()
-        )
-        + "\n"
+        f"⏱ Одна копка занимает <b>{DIG_TIME // 60} мин.</b>\n"
+        "Нажми <b>«Копать»</b> — и шахтёр отправится за добычей."
     )
-    if last_drops is not None:
-        text += f"\n💥 <b>Удар!</b>\n<i>{random.choice(SWING_PHRASES)}</i>\n\n"
-        if last_drops:
-            text += (
-                "🎁 <b>Добыча:</b>\n<blockquote>"
-                + "\n".join(
-                    f"{RESOURCES[i]['emoji']} {RESOURCES[i]['name']} <b>×{n}</b>"
-                    for i, n in last_drops.items()
-                )
-                + "</blockquote>"
-            )
-        else:
-            text += f"💨 <i>{random.choice(EMPTY_PHRASES)}</i>"
-    else:
-        text += "\n<i>Нажми на кнопку и ударь по породе…</i>"
-    return text
+    markup = kb(
+        (("⛏  Копать", "dig"),),
+        (("🎒 Инвентарь", "inventory"), ("🏠 Меню", "menu")),
+    )
+    return text, markup
+
+
+def digging_screen(left: float) -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        HEADER
+        + "<i>Шахтёр орудует киркой в глубине тоннеля. "
+        "Слышен глухой стук и звон породы…</i>\n\n"
+        f"{progress_bar(left)}\n"
+        f"⏳ Осталось: <b>{math.ceil(left)} сек.</b>"
+    )
+    markup = kb(
+        (("🔄 Обновить", "mine"),),
+        (("🎒 Инвентарь", "inventory"), ("🏠 Меню", "menu")),
+    )
+    return text, markup
+
+
+def ready_screen() -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        HEADER
+        + "✅ <b>Копка завершена!</b>\n"
+        "<i>Шахтёр вернулся с гружёной тележкой и ждёт тебя.</i>\n\n"
+        f"{progress_bar(0)}"
+    )
+    markup = kb(
+        (("📦 Забрать добычу", "claim"),),
+        (("🎒 Инвентарь", "inventory"), ("🏠 Меню", "menu")),
+    )
+    return text, markup
+
+
+def result_screen(drops: dict[str, int]) -> tuple[str, InlineKeyboardMarkup]:
+    loot = "\n".join(
+        f"{RESOURCES[i]['emoji']} {RESOURCES[i]['name']} <b>×{n}</b>"
+        for i, n in drops.items()
+    )
+    text = (
+        HEADER
+        + "🎁 <b>Добыча получена!</b>\n"
+        f"<blockquote>{loot}</blockquote>\n"
+        "<i>Всё сложено в рюкзак. Можно отправляться снова.</i>"
+    )
+    markup = kb(
+        (("⛏  Копать снова", "dig"),),
+        (("🎒 Инвентарь", "inventory"), ("🏠 Меню", "menu")),
+    )
+    return text, markup
+
+
+def mine_screen(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран шахты в зависимости от состояния копки."""
+    state, left = dig_state(user_id)
+    if state == "digging":
+        return digging_screen(left)
+    if state == "ready":
+        return ready_screen()
+    return idle_screen()
 
 
 def inventory_text(user_id: int) -> str:
@@ -246,22 +288,22 @@ def profile_text(user_id: int) -> str:
         "👤 <b>Профиль шахтёра</b>\n"
         f"{LINE}\n"
         f"🏷 Имя: <b>{html.escape(u['name'])}</b>\n"
-        f"⛏ Ударов киркой: <b>{u['swings']}</b>\n"
+        f"⛏ Копок завершено: <b>{u['swings']}</b>\n"
         f"💎 Добыто ресурсов: <b>{u['mined_total']}</b>\n\n"
-        "<i>Каждый великий шахтёр начинал с одного удара.</i>"
+        "<i>Каждый великий шахтёр начинал с одной копки.</i>"
     )
 
 
 # ══════════════════════════════════════════════════════════════
 #  ЗАЩИТА ОТ ФЛУДА / ЛИМИТОВ TELEGRAM
 # ══════════════════════════════════════════════════════════════
-# Telegram ограничивает частоту запросов бота (примерно 1 правка
-# одного сообщения в секунду). Что делаем, чтобы не словить 429:
 #   1) Middleware пропускает не чаще 1 действия за FLOOD_INTERVAL
 #      на игрока — лишние нажатия гасятся молча.
 #   2) Новых сообщений не шлём — только редактируем текущее.
-#   3) На любой нажатой кнопке сразу отвечаем call.answer().
-#   4) При TelegramRetryAfter не долбим повторно, а ждём.
+#   3) На каждую кнопку сразу отвечаем call.answer().
+#   4) Копка идёт по таймеру: игрок не кликает, значит запросов мало.
+#      По окончании бот сам один раз обновляет сообщение.
+#   5) При TelegramRetryAfter не повторяем запрос, а сообщаем игроку.
 
 
 class AntiFloodMiddleware(BaseMiddleware):
@@ -294,6 +336,7 @@ class AntiFloodMiddleware(BaseMiddleware):
 # ══════════════════════════════════════════════════════════════
 
 router = Router()
+_tasks: set[asyncio.Task] = set()  # чтобы задачи не удалялись сборщиком мусора
 
 
 async def show(call: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
@@ -312,6 +355,22 @@ async def show(call: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> 
             await call.answer()
         else:
             raise
+
+
+async def notify_when_ready(bot: Bot, user_id: int, chat_id: int, message_id: int) -> None:
+    """Через DIG_TIME сек один раз обновляет сообщение: «Копка завершена»."""
+    await asyncio.sleep(DIG_TIME + 0.5)
+    try:
+        if dig_state(user_id)[0] != "ready":  # уже забрал или что-то изменилось
+            return
+        text, markup = ready_screen()
+        await bot.edit_message_text(
+            text, chat_id=chat_id, message_id=message_id, reply_markup=markup
+        )
+    except (TelegramBadRequest, TelegramRetryAfter):
+        pass  # не страшно: игрок увидит результат по кнопке «Обновить»
+    except Exception:
+        logging.exception("Ошибка в notify_when_ready")
 
 
 @router.message(CommandStart())
@@ -337,19 +396,33 @@ async def cb_menu(call: CallbackQuery) -> None:
 @router.callback_query(F.data == "mine")
 async def cb_mine(call: CallbackQuery) -> None:
     ensure_user(call.from_user.id, call.from_user.full_name)
-    await show(call, mine_text(), mine_kb())
+    await show(call, *mine_screen(call.from_user.id))
 
 
-@router.callback_query(F.data == "swing")
-async def cb_swing(call: CallbackQuery) -> None:
-    ensure_user(call.from_user.id, call.from_user.full_name)
-    result = mine(call.from_user.id)
+@router.callback_query(F.data == "dig")
+async def cb_dig(call: CallbackQuery) -> None:
+    uid = call.from_user.id
+    ensure_user(uid, call.from_user.full_name)
 
-    if isinstance(result, float):
-        await call.answer(f"⏳ Кирка ещё звенит… {result:.1f} сек")
+    if start_dig(uid):
+        task = asyncio.create_task(
+            notify_when_ready(call.bot, uid, call.message.chat.id, call.message.message_id)
+        )
+        _tasks.add(task)
+        task.add_done_callback(_tasks.discard)
+
+    await show(call, *mine_screen(uid))
+
+
+@router.callback_query(F.data == "claim")
+async def cb_claim(call: CallbackQuery) -> None:
+    uid = call.from_user.id
+    ensure_user(uid, call.from_user.full_name)
+    drops = claim(uid)
+    if drops is None:
+        await show(call, *mine_screen(uid))  # ещё копает или уже забрано
         return
-
-    await show(call, mine_text(result), mine_kb())
+    await show(call, *result_screen(drops))
 
 
 @router.callback_query(F.data == "inventory")
