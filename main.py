@@ -30,7 +30,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 #  НАСТРОЙКИ
 # ══════════════════════════════════════════════════════════════
 
-BOT_TOKEN = "8771626322:AAFFJJimbIq4JLTh4-uHNkHDHcUCXiUn3fY"  # токен от @BotFather
+BOT_TOKEN = "8806693883:AAHRStDHxDVzlgY72cQamX7GhNf2xY7J8R0"  # токен от @BotFather
 DB_PATH = "game.db"
 MINE_COOLDOWN = 2.0  # секунд между ударами киркой
 
