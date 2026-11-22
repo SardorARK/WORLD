@@ -1,6 +1,6 @@
 """
 ⛏ Mine Bot — игровой Telegram-бот
-Версия 0.3: копка по таймеру (1 минута) + инвентарь + защита от флуда
+Версия 0.4: копка по таймеру + инвентарь + монеты, кошелёк и скупщик руды
 
 Установка:
     pip install "aiogram>=3.7"
@@ -38,11 +38,19 @@ FLOOD_INTERVAL = 0.7   # минимум между нажатиями одног
 
 # За одну копку игрок получает случайное число каждого ресурса
 # в диапазоне amount = (мин, макс).
+# price — цена продажи одной штуки у скупщика (в монетах).
 RESOURCES: dict[str, dict] = {
-    "stone": {"emoji": "🪨", "name": "Камень",  "amount": (15, 25)},
-    "coal":  {"emoji": "⚫", "name": "Уголь",   "amount": (2, 7)},
-    "flint": {"emoji": "🔥", "name": "Кремень", "amount": (5, 12)},
+    "stone": {"emoji": "🪨", "name": "Камень",  "amount": (15, 25), "price": 1},
+    "coal":  {"emoji": "⚫", "name": "Уголь",   "amount": (2, 7),   "price": 5},
+    "flint": {"emoji": "🔥", "name": "Кремень", "amount": (5, 12),  "price": 3},
 }
+
+# Премиум-эмодзи (работают в тексте сообщений; если не поддерживаются —
+# Telegram покажет обычные 🤑 и 💰).
+COIN = '<tg-emoji emoji-id="5433631991675244306">🤑</tg-emoji>'     # монета
+WALLET = '<tg-emoji emoji-id="5417924076503062111">💰</tg-emoji>'   # кошелёк
+
+SELL_STEPS = (1, 10, 50)  # кнопки «продать N штук» (плюс «Всё»)
 
 LINE = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
 
@@ -71,6 +79,10 @@ db.executescript(
 )
 try:  # миграция для старых баз
     db.execute("ALTER TABLE users ADD COLUMN dig_end REAL NOT NULL DEFAULT 0")
+except sqlite3.OperationalError:
+    pass
+try:
+    db.execute("ALTER TABLE users ADD COLUMN balance INTEGER NOT NULL DEFAULT 0")
 except sqlite3.OperationalError:
     pass
 db.commit()
@@ -149,6 +161,42 @@ def claim(user_id: int) -> dict[str, int] | None:
     return drops
 
 
+def sell(user_id: int, item: str, count: int | None) -> tuple[int, int]:
+    """
+    Продаёт руду. count=None — продать всё.
+    Возвращает (продано штук, получено монет).
+    """
+    res = RESOURCES.get(item)
+    if res is None:
+        return 0, 0
+    have = get_inventory(user_id).get(item, 0)
+    n = have if count is None else min(count, have)
+    if n <= 0:
+        return 0, 0
+    earned = n * res["price"]
+    db.execute(
+        "UPDATE inventory SET amount = amount - ? WHERE user_id = ? AND item = ?",
+        (n, user_id, item),
+    )
+    db.execute(
+        "UPDATE users SET balance = balance + ? WHERE user_id = ?", (earned, user_id)
+    )
+    db.commit()
+    return n, earned
+
+
+def sell_everything(user_id: int) -> tuple[dict[str, int], int]:
+    """Продаёт все руды. Возвращает ({ресурс: штук}, всего монет)."""
+    sold: dict[str, int] = {}
+    total = 0
+    for item in RESOURCES:
+        n, earned = sell(user_id, item, None)
+        if n:
+            sold[item] = n
+            total += earned
+    return sold, total
+
+
 # ══════════════════════════════════════════════════════════════
 #  ТЕКСТЫ И КЛАВИАТУРЫ
 # ══════════════════════════════════════════════════════════════
@@ -166,7 +214,15 @@ def kb(*rows: tuple[tuple[str, str], ...]) -> InlineKeyboardMarkup:
 def menu_kb() -> InlineKeyboardMarkup:
     return kb(
         (("⛏  Спуститься в шахту", "mine"),),
-        (("🎒 Инвентарь", "inventory"), ("👤 Профиль", "profile")),
+        (("🎒 Инвентарь", "inventory"), ("🛒 Скупщик", "market")),
+        (("👤 Профиль", "profile"),),
+    )
+
+
+def inventory_kb() -> InlineKeyboardMarkup:
+    return kb(
+        (("🛒 Продать руду", "market"),),
+        (("⛏ В шахту", "mine"), ("🏠 Меню", "menu")),
     )
 
 
@@ -277,7 +333,8 @@ def inventory_text(user_id: int) -> str:
         "🎒 <b>Твой инвентарь</b>\n"
         f"{LINE}\n"
         "<blockquote>" + "\n".join(lines) + "</blockquote>\n"
-        f"📦 Всего предметов: <b>{total}</b>\n\n"
+        f"📦 Всего предметов: <b>{total}</b>\n"
+        f"{WALLET} Кошелёк: <b>{get_user(user_id)['balance']}</b> {COIN}\n\n"
         "<i>Всё, что добыто честным трудом, лежит здесь.</i>"
     )
 
@@ -288,10 +345,64 @@ def profile_text(user_id: int) -> str:
         "👤 <b>Профиль шахтёра</b>\n"
         f"{LINE}\n"
         f"🏷 Имя: <b>{html.escape(u['name'])}</b>\n"
+        f"{WALLET} Кошелёк: <b>{u['balance']}</b> {COIN}\n"
         f"⛏ Копок завершено: <b>{u['swings']}</b>\n"
         f"💎 Добыто ресурсов: <b>{u['mined_total']}</b>\n\n"
         "<i>Каждый великий шахтёр начинал с одной копки.</i>"
     )
+
+
+def market_screen(user_id: int, note: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    """Главный экран скупщика: цены, запасы, выбор руды."""
+    inv = get_inventory(user_id)
+    lines = [
+        f"{res['emoji']} {res['name']} — <b>{inv.get(item, 0)}</b> шт. "
+        f"<i>(по {res['price']} {COIN})</i>"
+        for item, res in RESOURCES.items()
+    ]
+    worth = sum(inv.get(i, 0) * r["price"] for i, r in RESOURCES.items())
+    text = (
+        "🛒 <b>Скупщик руды</b>\n"
+        f"{LINE}\n"
+        "<i>Старый гном щёлкает счётами и придирчиво разглядывает "
+        "твой мешок: «Хорошую цену дам, не обижу!»</i>\n\n"
+    )
+    if note:
+        text += f"{note}\n\n"
+    text += (
+        "<blockquote>" + "\n".join(lines) + "</blockquote>\n"
+        f"{WALLET} Кошелёк: <b>{get_user(user_id)['balance']}</b> {COIN}\n"
+        f"💼 Всё можно продать за: <b>{worth}</b> {COIN}"
+    )
+    rows: list[tuple[tuple[str, str], ...]] = [
+        tuple((f"{r['emoji']} {r['name']}", f"sell_menu:{i}") for i, r in RESOURCES.items())
+    ]
+    if worth:
+        rows.append((("💸 Продать всё", "sell_all"),))
+    rows.append((("⛏ В шахту", "mine"), ("🏠 Меню", "menu")))
+    return text, kb(*rows)
+
+
+def sell_screen(user_id: int, item: str, note: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    """Экран продажи одной руды."""
+    res = RESOURCES[item]
+    have = get_inventory(user_id).get(item, 0)
+    text = (
+        f"🛒 <b>Продажа: {res['emoji']} {res['name']}</b>\n"
+        f"{LINE}\n"
+    )
+    if note:
+        text += f"{note}\n\n"
+    text += (
+        f"🎒 У тебя: <b>{have}</b> шт.\n"
+        f"🏷 Цена: <b>{res['price']}</b> {COIN} за штуку\n"
+        f"{WALLET} Кошелёк: <b>{get_user(user_id)['balance']}</b> {COIN}\n\n"
+        "<i>Сколько отсыпать гному?</i>"
+    )
+    step_row = tuple((f"×{n}", f"sell:{item}:{n}") for n in SELL_STEPS) + (
+        ("Всё", f"sell:{item}:all"),
+    )
+    return text, kb(step_row, (("🛒 Назад к скупщику", "market"),))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -428,7 +539,68 @@ async def cb_claim(call: CallbackQuery) -> None:
 @router.callback_query(F.data == "inventory")
 async def cb_inventory(call: CallbackQuery) -> None:
     ensure_user(call.from_user.id, call.from_user.full_name)
-    await show(call, inventory_text(call.from_user.id), back_kb())
+    await show(call, inventory_text(call.from_user.id), inventory_kb())
+
+
+@router.callback_query(F.data == "market")
+async def cb_market(call: CallbackQuery) -> None:
+    ensure_user(call.from_user.id, call.from_user.full_name)
+    await show(call, *market_screen(call.from_user.id))
+
+
+@router.callback_query(F.data.startswith("sell_menu:"))
+async def cb_sell_menu(call: CallbackQuery) -> None:
+    ensure_user(call.from_user.id, call.from_user.full_name)
+    item = call.data.split(":")[1]
+    if item not in RESOURCES:
+        await call.answer()
+        return
+    await show(call, *sell_screen(call.from_user.id, item))
+
+
+@router.callback_query(F.data.startswith("sell:"))
+async def cb_sell(call: CallbackQuery) -> None:
+    uid = call.from_user.id
+    ensure_user(uid, call.from_user.full_name)
+    try:
+        _, item, amount = call.data.split(":")
+        count = None if amount == "all" else int(amount)
+    except ValueError:
+        await call.answer()
+        return
+    if item not in RESOURCES:
+        await call.answer()
+        return
+
+    n, earned = sell(uid, item, count)
+    res = RESOURCES[item]
+    if n:
+        note = (
+            f"✅ Продано: {res['emoji']} {res['name']} <b>×{n}</b>\n"
+            f"💵 Получено: <b>+{earned}</b> {COIN}"
+        )
+    else:
+        note = f"❌ <i>Нечего продавать — {res['name'].lower()} закончился.</i>"
+    await show(call, *sell_screen(uid, item, note))
+
+
+@router.callback_query(F.data == "sell_all")
+async def cb_sell_all(call: CallbackQuery) -> None:
+    uid = call.from_user.id
+    ensure_user(uid, call.from_user.full_name)
+    sold, total = sell_everything(uid)
+    if sold:
+        items = "\n".join(
+            f"{RESOURCES[i]['emoji']} {RESOURCES[i]['name']} <b>×{n}</b>"
+            for i, n in sold.items()
+        )
+        note = (
+            f"✅ <b>Всё продано!</b>\n<blockquote>{items}</blockquote>\n"
+            f"💵 Получено: <b>+{total}</b> {COIN}"
+        )
+    else:
+        note = "❌ <i>Продавать пока нечего — сначала накопай руды.</i>"
+    await show(call, *market_screen(uid, note))
 
 
 @router.callback_query(F.data == "profile")
